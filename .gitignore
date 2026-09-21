@@ -1,0 +1,19 @@
+# WiFi Security Auditor - local/private data
+wifi_auditor_baseline.json
+wifi_auditor_history.json
+wifi_auditor_lan_config.json
+
+# Generated reports and logs
+*.log
+wifi_auditor_report*.txt
+wifi_auditor_report*.json
+
+# Python temporary files
+__pycache__/
+*.pyc
+*.pyo
+
+# Termux/editor temporary files
+*.tmp
+*.bak
+*~
