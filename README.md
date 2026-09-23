@@ -53,7 +53,6 @@ Depending on the WiFi driver, some details such as channel width, WPS state or P
 
 Check that Python is installed:
 
-'''shell
 python
 Install the required packages:
 pkg update
