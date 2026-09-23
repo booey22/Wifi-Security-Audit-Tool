@@ -45,7 +45,14 @@ Git clone https://github.com/booey22/Wifi-Security-Audit-Tool.git
 cd Wifi-Security-Audit-Tool
 python wifi_auditor.py
 
-Termux / Android
+Windows Notes
+Windows WiFi information is collected using built-in Windows networking tools.
+Depending on the WiFi driver, some details such as channel width, WPS state or PMF state may not be reported by Windows. When information is unavailable, the auditor reports it as unknown rather than guessing.
+
+## Termux / Android
+
+'''shell
+python
 Install the required packages:
 pkg update
 pkg install python git termux-api iproute2
@@ -60,10 +67,6 @@ Because of this, the auditor may ask you to manually provide:
 - Router or gateway IPv4 address, for example 192.168.1.1
 Use values supplied by your own router or network configuration. Do not guess the subnet.
 Some device MAC-address information may also be restricted by Android.
-
-Windows Notes
-Windows WiFi information is collected using built-in Windows networking tools.
-Depending on the WiFi driver, some details such as channel width, WPS state or PMF state may not be reported by Windows. When information is unavailable, the auditor reports it as unknown rather than guessing.
 
 
 Local Data
@@ -81,3 +84,6 @@ This project is under active development.
 Current builds have been tested on:
 - Windows
 - Termux on Android
+
+
+Development by Boeey22 Aka Bug-a-Boo Cybersecurity Professional build out of Curiosity 
