@@ -37,7 +37,7 @@ The same `wifi_auditor.py` codebase is used on both platforms.
 ## Windows
 
 Check that Python is installed:
-
+Windows 
 ```powershell
 python --version
 Clone the repository:
@@ -50,7 +50,7 @@ Windows WiFi information is collected using built-in Windows networking tools.
 Depending on the WiFi driver, some details such as channel width, WPS state or PMF state may not be reported by Windows. When information is unavailable, the auditor reports it as unknown rather than guessing.
 
 ## Termux / Android
-
+termux
 '''shell
 python
 Install the required packages:
