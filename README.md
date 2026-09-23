@@ -37,7 +37,7 @@ The same `wifi_auditor.py` codebase is used on both platforms.
 ## Windows
 
 Check that Python is installed:
-Windows 
+
 ```powershell
 python --version
 Clone the repository:
@@ -49,13 +49,16 @@ Windows Notes
 Windows WiFi information is collected using built-in Windows networking tools.
 Depending on the WiFi driver, some details such as channel width, WPS state or PMF state may not be reported by Windows. When information is unavailable, the auditor reports it as unknown rather than guessing.
 
-## Termux / Android
-termux
+## Termux/Android
+
+Check that Python is installed:
+
 '''shell
 python
 Install the required packages:
 pkg update
 pkg install python git termux-api iproute2
+Clone the repository:
 git clone https://github.com/booey22/Wifi-Security-Audit-Tool.git
 cd Wifi-Security-Audit-Tool
 python wifi_auditor.py
@@ -69,7 +72,7 @@ Use values supplied by your own router or network configuration. Do not guess th
 Some device MAC-address information may also be restricted by Android.
 
 
-Local Data
+## Local Data
 The auditor may create local runtime files including:
 - wifi_auditor_baseline.json
 - wifi_auditor_history.json
