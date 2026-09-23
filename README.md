@@ -49,7 +49,7 @@ Windows Notes
 Windows WiFi information is collected using built-in Windows networking tools.
 Depending on the WiFi driver, some details such as channel width, WPS state or PMF state may not be reported by Windows. When information is unavailable, the auditor reports it as unknown rather than guessing.
 
-## Termux/Android
+## Termux/Android 
 
 Check that Python is installed:
 
@@ -72,7 +72,7 @@ Use values supplied by your own router or network configuration. Do not guess th
 Some device MAC-address information may also be restricted by Android.
 
 
-## Local Data
+## Data
 The auditor may create local runtime files including:
 - wifi_auditor_baseline.json
 - wifi_auditor_history.json
