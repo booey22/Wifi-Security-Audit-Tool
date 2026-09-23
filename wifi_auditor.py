@@ -2,7 +2,7 @@
 
 """
 WiFi Security Auditor Development
-Termux / Android Edition
+Windows / Termux / Android Edition
 
 Authorised defensive network auditing tool.
 
@@ -22,7 +22,7 @@ V3.4:
     - Improved ASUS / TrueNAS / TP-Link identification
     - Shows strongest approximately overlapping WiFi APs
     - Cleaner consolidated findings
-    - TCP-only LAN discovery
+    - Controlled-concurrency ICMP and TCP LAN discovery
     - Safe GET requests only
     - No credential submission
     - No brute forcing or exploitation
@@ -42,6 +42,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -63,6 +64,7 @@ LEGACY_CONFIG_FILES = [
 
 BASELINE_FILE = "wifi_auditor_baseline.json"
 HISTORY_FILE = "wifi_auditor_history.json"
+DEVICE_LABELS_FILE = "wifi_auditor_device_labels.json"
 LEGACY_BASELINES = [
     "wifi_auditor_baseline_v33.json",
 ]
@@ -72,6 +74,14 @@ REPORT_PREFIX = "wifi_audit"
 DISCOVERY_PASSES = 2
 DISCOVERY_TIMEOUT = 0.30
 PORT_TIMEOUT = 0.50
+ICMP_TIMEOUT_MS = 700
+DISCOVERY_WORKERS = 48
+
+# Deliberately small, reviewed hints. An OUI identifies the manufacturer that
+# received a MAC prefix, not a guaranteed product or console model.
+CONSOLE_OUI_HINTS = {
+    "bc:33:29": ("Sony Interactive Entertainment Inc.", "Possible PlayStation"),
+}
 HTTP_TIMEOUT = 4
 MAX_DISCOVERY_HOSTS = 1024
 MAX_HTTP_BYTES = 512 * 1024
@@ -135,6 +145,7 @@ RFC1918_NETWORKS = [
 SESSION_LAN = None
 AUDIT_FINDINGS = []
 LAST_AUDIT = None
+LAST_DISCOVERY = []
 
 
 # ============================================================
@@ -356,6 +367,11 @@ def is_termux():
     )
 
 
+def is_windows():
+    """Return True for the supported native Windows implementation."""
+    return sys.platform.startswith("win")
+
+
 # ============================================================
 # IP VALIDATION
 # ============================================================
@@ -456,6 +472,21 @@ def frequency_to_band(freq):
         return "6 GHz"
 
     return "Unknown"
+
+
+def channel_to_frequency(channel):
+    """Approximate centre frequency for channels reported by Windows netsh."""
+    try:
+        channel = int(channel)
+    except (TypeError, ValueError):
+        return None
+    if 1 <= channel <= 13:
+        return 2407 + channel * 5
+    if channel == 14:
+        return 2484
+    if 32 <= channel <= 177:
+        return 5000 + channel * 5
+    return None
 
 
 def signal_quality(rssi):
@@ -565,7 +596,240 @@ def classify_wifi_security(capabilities):
 # TERMUX WIFI API
 # ============================================================
 
+def parse_windows_key_values(text):
+    """Parse the simple ``label : value`` output used by netsh."""
+    values = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        values[key.strip().lower()] = value.strip()
+    return values
+
+
+def windows_ipconfig_adapter_block(text, interface):
+    """Return the matching adapter section without confusing similarly named adapters."""
+    if not interface:
+        return text
+    header = re.compile(
+        rf"(?im)^[^\r\n]*adapter\s+{re.escape(interface)}\s*:\s*$"
+    )
+    match = header.search(text)
+    if not match:
+        return text
+    following = re.search(r"(?im)^[^\r\n]*adapter\s+.+:\s*$", text[match.end():])
+    end = match.end() + following.start() if following else len(text)
+    return text[match.start():end]
+
+
+def windows_adapter_details_for_ipv4(text, current_ip):
+    """Find the ipconfig adapter section that owns ``current_ip``."""
+    headers = list(re.finditer(r"(?im)^([^\r\n]*adapter\s+(.+?))\s*:\s*$", text))
+    for index, header in enumerate(headers):
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(text)
+        block = text[header.start():end]
+        if current_ip and current_ip in block:
+            gateway_match = re.search(r"\bDefault Gateway[^:]*:\s*([\s\S]{0,180})", block, re.I)
+            gateways = re.findall(r"\b\d+\.\d+\.\d+\.\d+\b", gateway_match.group(1) if gateway_match else "")
+            return {
+                "interface": header.group(2).strip(),
+                "block": block,
+                "gateway": gateways[0] if gateways else None,
+            }
+    return None
+
+
+def windows_wifi_connection():
+    """Return read-only WiFi connection data from Windows native tools.
+
+    The parser accepts the common modern ``netsh wlan show interfaces`` labels
+    but never guesses values that Windows did not report.
+    """
+    result = run_command(["netsh", "wlan", "show", "interfaces"], timeout=10)
+    output = result["stdout"]
+    if not output:
+        return None, result["stderr"] or "Windows WiFi interface information is unavailable"
+
+    def field(label_pattern):
+        match = re.search(
+            rf"(?im)^\s*{label_pattern}\s*:\s*(.*?)\s*$",
+            output,
+        )
+        return match.group(1).strip() if match else None
+
+    state = (field(r"State") or "").lower()
+    if state != "connected":
+        return None, "Windows reports no connected WiFi interface"
+
+    interface = field(r"Name") or ""
+    ssid = field(r"SSID")
+    bssid = field(r"(?:AP\s+)?BSSID")
+    if bssid:
+        bssid = bssid.replace("-", ":").lower()
+
+    channel = None
+    channel_text = field(r"Channel")
+    if channel_text:
+        match = re.search(r"\d+", channel_text)
+        if match:
+            channel = int(match.group(0))
+
+    signal_percent = None
+    signal_text = field(r"Signal")
+    if signal_text:
+        match = re.search(r"\d+", signal_text)
+        if match:
+            signal_percent = int(match.group(0))
+
+    link_speed = None
+    for speed_label in (r"Receive rate \(Mbps\)", r"Transmit rate \(Mbps\)"):
+        value = field(speed_label)
+        if value:
+            try:
+                candidate = float(value)
+                link_speed = max(link_speed or 0, candidate)
+            except ValueError:
+                pass
+    if isinstance(link_speed, float) and link_speed.is_integer():
+        link_speed = int(link_speed)
+
+    authentication = field(r"Authentication") or ""
+    cipher = field(r"Cipher") or ""
+
+    ipconfig = run_command(["ipconfig"], timeout=10)
+    ipv4 = None
+    gateway = None
+    if ipconfig["stdout"]:
+        selected = windows_ipconfig_adapter_block(ipconfig["stdout"], interface)
+        addresses = re.findall(
+            r"\b(?:IPv4 Address|IPv4)[^:]*:\s*(\d+\.\d+\.\d+\.\d+)",
+            selected,
+            re.I,
+        )
+        gateways = re.findall(
+            r"\bDefault Gateway[^:]*:\s*(\d+\.\d+\.\d+\.\d+)",
+            selected,
+            re.I,
+        )
+        ipv4 = addresses[0] if addresses else None
+        gateway = gateways[0] if gateways else None
+
+    return {
+        "ssid": ssid,
+        "bssid": bssid,
+        "ip": ipv4,
+        "supplicant_state": "COMPLETED",
+        "frequency_mhz": channel_to_frequency(channel),
+        "channel": channel,
+        "rssi": None,
+        "signal_percent": signal_percent,
+        "link_speed_mbps": link_speed,
+        "ssid_hidden": False,
+        "mac_address": field(r"Physical address"),
+        "interface": interface,
+        "gateway": gateway,
+        "authentication": authentication,
+        "cipher": cipher,
+        "source": "Windows netsh/ipconfig",
+    }, None
+
+def windows_nearby_wifi():
+    """Read nearby AP metadata using netsh; this does not connect or authenticate."""
+    result = run_command(["netsh", "wlan", "show", "networks", "mode=bssid"], timeout=20)
+    if not result["stdout"]:
+        return None, result["stderr"] or "Windows WiFi scan information is unavailable"
+
+    records = []
+    network_name = ""
+    authentication = ""
+    encryption = ""
+    current = None
+
+    def capabilities_for(auth, cipher):
+        auth_upper = (auth or "").upper()
+        cipher_upper = (cipher or "").upper()
+        tokens = [auth_upper, cipher_upper]
+        if "WPA3" in auth_upper and "PERSONAL" in auth_upper:
+            tokens.extend(["SAE", "RSN"])
+        elif "WPA2" in auth_upper and "PERSONAL" in auth_upper:
+            tokens.extend(["WPA2", "PSK", "RSN"])
+        elif "WPA" in auth_upper and "PERSONAL" in auth_upper:
+            tokens.extend(["WPA", "PSK"])
+        if "ENTERPRISE" in auth_upper:
+            tokens.append("EAP")
+            if "WPA2" in auth_upper or "WPA3" in auth_upper:
+                tokens.append("RSN")
+        if "OPEN" in auth_upper:
+            tokens.append("[ESS]")
+        return " ".join(token for token in tokens if token)
+
+    for line in result["stdout"].splitlines():
+        stripped = line.strip()
+        ssid = re.match(r"SSID\s+\d+\s*:\s*(.*)$", stripped, re.I)
+        bssid = re.match(r"BSSID\s+\d+\s*:\s*([0-9a-f:-]{17})$", stripped, re.I)
+
+        if ssid:
+            if current:
+                records.append(current)
+                current = None
+            network_name = ssid.group(1).strip()
+            authentication = ""
+            encryption = ""
+            continue
+
+        if bssid:
+            if current:
+                records.append(current)
+            current = {
+                "ssid": network_name,
+                "bssid": bssid.group(1).replace("-", ":").lower(),
+                "capabilities": capabilities_for(authentication, encryption),
+                "authentication": authentication,
+                "encryption": encryption,
+                "channel_bandwidth_mhz": None,
+                "bandwidth_known": False,
+                "wps_known": False,
+                "pmf_known": False,
+                "source": "Windows netsh",
+            }
+            continue
+
+        if ":" not in stripped:
+            continue
+
+        key, value = (part.strip() for part in stripped.split(":", 1))
+        key_lower = key.lower()
+
+        if key_lower == "authentication":
+            authentication = value
+            if current is not None:
+                current["authentication"] = value
+                current["capabilities"] = capabilities_for(authentication, encryption)
+        elif key_lower == "encryption":
+            encryption = value
+            if current is not None:
+                current["encryption"] = value
+                current["capabilities"] = capabilities_for(authentication, encryption)
+        elif current is not None and key_lower == "signal":
+            match = re.search(r"(\d+)", value)
+            if match:
+                current["signal_percent"] = int(match.group(1))
+        elif current is not None and key_lower == "channel":
+            match = re.search(r"\d+", value)
+            if match:
+                current["channel"] = int(match.group(0))
+                current["frequency_mhz"] = channel_to_frequency(current["channel"])
+
+    if current:
+        records.append(current)
+    if not records:
+        return None, "Windows WiFi scan output could not be parsed (English netsh labels are required)"
+    return records, None
+
 def get_wifi_connection():
+
+    if is_windows():
+        return windows_wifi_connection()
 
     if not command_exists("termux-wifi-connectioninfo"):
 
@@ -588,6 +852,9 @@ def get_wifi_connection():
 
 
 def scan_nearby_wifi():
+
+    if is_windows():
+        return windows_nearby_wifi()
 
     if not command_exists("termux-wifi-scaninfo"):
 
@@ -636,7 +903,7 @@ def show_current_wifi():
     speed = data.get("link_speed_mbps")
     hidden = data.get("ssid_hidden", False)
 
-    channel = frequency_to_channel(freq)
+    channel = data.get("channel") or frequency_to_channel(freq)
 
     print(f"SSID              : {ssid}")
     print(f"BSSID             : {bssid}")
@@ -646,14 +913,16 @@ def show_current_wifi():
     print(f"Band              : {frequency_to_band(freq)}")
     print(f"Channel           : {channel or 'Unknown'}")
 
-    print(
-        f"RSSI              : "
-        f"{rssi if rssi is not None else 'Unknown'} dBm"
-    )
-
-    print(
-        f"Signal quality    : {signal_quality(rssi)}"
-    )
+    if data.get("signal_percent") is not None:
+        print(f"Signal            : {data['signal_percent']}% (Windows-reported)")
+    else:
+        print(
+            f"RSSI              : "
+            f"{rssi if rssi is not None else 'Unknown'} dBm"
+        )
+        print(
+            f"Signal quality    : {signal_quality(rssi)}"
+        )
 
     print(
         f"Link speed        : {speed or 'Unknown'} Mbps"
@@ -670,7 +939,7 @@ def show_current_wifi():
 
     else:
         print(
-            "Device WiFi MAC   : Restricted by Android"
+            "Device WiFi MAC   : " + ("Not reported by Windows" if is_windows() else "Restricted by Android")
         )
 
     return data
@@ -687,25 +956,20 @@ def normalise_scan_record(record):
     )
 
     freq = record.get("frequency_mhz")
+    if freq is None:
+        freq = channel_to_frequency(record.get("channel"))
+
+    raw_bandwidth = record.get("channel_bandwidth_mhz")
+    try:
+        bandwidth = int(raw_bandwidth) if raw_bandwidth is not None else None
+    except Exception:
+        bandwidth = None
 
     try:
-        bandwidth = int(
-            record.get("channel_bandwidth_mhz", 20)
-        )
-
+        center = int(record.get("center_frequency_mhz"))
     except Exception:
-        bandwidth = 20
-
-    try:
-        center = int(
-            record.get("center_frequency_mhz")
-        )
-
-    except Exception:
-
         try:
             center = int(freq)
-
         except Exception:
             center = None
 
@@ -713,21 +977,25 @@ def normalise_scan_record(record):
         "ssid": record.get("ssid", ""),
         "bssid": record.get("bssid", ""),
         "frequency": freq,
-        "channel": frequency_to_channel(freq),
+        "channel": frequency_to_channel(freq) or record.get("channel"),
         "band": frequency_to_band(freq),
         "rssi": record.get("rssi"),
         "signal": signal_quality(record.get("rssi")),
+        "signal_percent": record.get("signal_percent"),
         "bandwidth": bandwidth,
+        "bandwidth_known": bool(record.get("bandwidth_known", raw_bandwidth is not None)),
         "center_frequency": center,
         "capabilities": record.get("capabilities", ""),
         "security": security["security"],
         "cipher": security["cipher"],
         "wps": security["wps"],
+        "wps_known": bool(record.get("wps_known", True)),
         "enterprise": security["enterprise"],
         "pmf_required": security["pmf_required"],
         "pmf_capable": security["pmf_capable"],
+        "pmf_known": bool(record.get("pmf_known", True)),
+        "source": record.get("source"),
     }
-
 
 # ============================================================
 # APPROXIMATE RF OVERLAP
@@ -789,6 +1057,9 @@ def calculate_connected_overlap(records, connected_bssid):
         connected
     )
 
+    if connected_range is None:
+        return None
+
     overlapping = []
 
     for ap in records:
@@ -846,11 +1117,14 @@ def print_wifi_ap(ap, connected=False, same_ssid=False):
         f"    BSSID      : {ap['bssid'] or 'Unknown'}"
     )
 
-    print(
-        f"    Signal     : "
-        f"{ap['rssi'] if ap['rssi'] is not None else 'Unknown'} "
-        f"dBm ({ap['signal']})"
-    )
+    if ap.get("signal_percent") is not None:
+        print(f"    Signal     : {ap['signal_percent']}% (Windows-reported)")
+    else:
+        print(
+            f"    Signal     : "
+            f"{ap['rssi'] if ap['rssi'] is not None else 'Unknown'} "
+            f"dBm ({ap['signal']})"
+        )
 
     print(f"    Band       : {ap['band']}")
 
@@ -859,7 +1133,7 @@ def print_wifi_ap(ap, connected=False, same_ssid=False):
     )
 
     print(
-        f"    Width      : {ap['bandwidth']} MHz"
+        f"    Width      : {str(ap['bandwidth']) + ' MHz' if ap.get('bandwidth') is not None else 'Unknown (not reported by Windows)'}"
     )
 
     print(
@@ -872,15 +1146,15 @@ def print_wifi_ap(ap, connected=False, same_ssid=False):
 
     print(
         f"    WPS        : "
-        f"{'Enabled' if ap['wps'] else 'Not advertised'}"
+        f"{'Unknown / not reported by Windows' if not ap.get('wps_known', True) else ('Enabled' if ap['wps'] else 'Not advertised')}"
     )
 
-    if ap["pmf_required"]:
+    if not ap.get("pmf_known", True):
+        pmf = "Unknown / not reported by Windows"
+    elif ap["pmf_required"]:
         pmf = "Required"
-
     elif ap["pmf_capable"]:
         pmf = "Capable"
-
     else:
         pmf = "Not advertised"
 
@@ -940,7 +1214,9 @@ def show_nearby_wifi():
     records.sort(
         key=lambda item: (
             item["rssi"]
-            if isinstance(item["rssi"], int)
+            if isinstance(item.get("rssi"), int)
+            else item.get("signal_percent")
+            if isinstance(item.get("signal_percent"), int)
             else -999
         ),
         reverse=True,
@@ -1074,9 +1350,12 @@ def analyse_wifi_environment(records, connected_bssid=""):
         f"WEP networks        : {len(wep_networks)}"
     )
 
-    print(
-        f"WPS advertised      : {len(wps_networks)}"
-    )
+    if records and not any(ap.get("wps_known", True) for ap in records):
+        print("WPS advertised      : Not determined on Windows")
+    else:
+        print(
+            f"WPS advertised      : {len(wps_networks)}"
+        )
 
     print(
         f"Hidden SSIDs        : {len(hidden_networks)}"
@@ -1104,23 +1383,26 @@ def analyse_wifi_environment(records, connected_bssid=""):
 
         print(
             f"WPS        : "
-            f"{'Enabled' if connected_ap['wps'] else 'Not advertised'}"
+            f"{'Unknown / not reported by Windows' if not connected_ap.get('wps_known', True) else ('Enabled' if connected_ap['wps'] else 'Not advertised')}"
         )
 
-        print(
-            f"Signal     : "
-            f"{connected_ap['rssi']} dBm "
-            f"({connected_ap['signal']})"
-        )
+        if connected_ap.get("signal_percent") is not None:
+            print(f"Signal     : {connected_ap['signal_percent']}% (Windows-reported)")
+            signal_summary = f"{connected_ap['signal_percent']}% (Windows-reported)"
+        else:
+            print(
+                f"Signal     : "
+                f"{connected_ap['rssi']} dBm "
+                f"({connected_ap['signal']})"
+            )
+            signal_summary = f"{connected_ap['rssi']} dBm ({connected_ap['signal']})"
 
         add_finding(
             "INFO",
             "Your WiFi",
             (
                 f"{connected_ap['security']} with "
-                f"{connected_ap['cipher']}; signal "
-                f"{connected_ap['rssi']} dBm "
-                f"({connected_ap['signal']})."
+                f"{connected_ap['cipher']}; signal {signal_summary}."
             ),
         )
 
@@ -1135,7 +1417,7 @@ def analyse_wifi_environment(records, connected_bssid=""):
                 ),
             )
 
-        if not (
+        if connected_ap.get("pmf_known", True) and not (
             connected_ap["pmf_required"]
             or connected_ap["pmf_capable"]
         ):
@@ -1208,8 +1490,8 @@ def analyse_wifi_environment(records, connected_bssid=""):
     if not overlap:
 
         print(
-            "Connected AP could not be correlated "
-            "with the WiFi scan."
+            "Connected AP could not be correlated with the WiFi scan, "
+            "or channel-width data was unavailable."
         )
 
     else:
@@ -1314,6 +1596,18 @@ def analyse_wifi_environment(records, connected_bssid=""):
 
 def parse_ip_route():
 
+    if is_windows():
+        connection, error = windows_wifi_connection()
+        if error or not connection:
+            return None
+        ipconfig = run_command(["ipconfig"], timeout=10)
+        details = windows_adapter_details_for_ipv4(ipconfig["stdout"], connection.get("ip")) if ipconfig["stdout"] else None
+        return {
+            "src": connection.get("ip"),
+            "interface": (details or {}).get("interface") or connection.get("interface"),
+            "gateway": (details or {}).get("gateway") or connection.get("gateway"),
+        }
+
     if not command_exists("ip"):
         return None
 
@@ -1363,6 +1657,23 @@ def parse_ip_route():
 
 
 def get_interface_network(interface):
+
+    if is_windows():
+        connection, error = windows_wifi_connection()
+        if error or not connection:
+            return None
+        ipconfig = run_command(["ipconfig"], timeout=10)
+        if not ipconfig["stdout"]:
+            return None
+        details = windows_adapter_details_for_ipv4(ipconfig["stdout"], connection.get("ip"))
+        selected = details["block"] if details else windows_ipconfig_adapter_block(ipconfig["stdout"], interface)
+        match = re.search(r"\b(?:IPv4 Address|IPv4)[^:]*:\s*(\d+\.\d+\.\d+\.\d+).*?\bSubnet Mask[^:]*:\s*(\d+\.\d+\.\d+\.\d+)", selected, re.I | re.S)
+        if not match:
+            return None
+        try:
+            return ipaddress.IPv4Network(f"{match.group(1)}/{match.group(2)}", strict=False)
+        except ValueError:
+            return None
 
     if not interface or not command_exists("ip"):
         return None
@@ -2158,12 +2469,18 @@ def detect_lan():
         except Exception:
             pass
 
-    result["reason"] = (
-        "WiFi is connected, but Android blocked "
-        "automatic subnet/gateway detection. "
-        "Activate the validated saved LAN "
-        "configuration for this session."
-    )
+    if is_windows():
+        result["reason"] = (
+            "WiFi is connected, but Windows did not provide a usable "
+            "private IPv4 gateway/subnet through the available commands. "
+            "Activate a validated LAN configuration for this session."
+        )
+    else:
+        result["reason"] = (
+            "WiFi is connected, but Android blocked automatic subnet/gateway "
+            "detection. Activate the validated saved LAN configuration for "
+            "this session."
+        )
 
     return result
 
@@ -2218,7 +2535,7 @@ def show_network_information():
 
     print(
         f"Platform          : "
-        f"{'Android' if is_android() else sys.platform}"
+        f"{'Windows' if is_windows() else ('Android' if is_android() else sys.platform)}"
     )
 
     print(
@@ -2276,6 +2593,14 @@ def show_interfaces():
 
     heading("NETWORK INTERFACES")
 
+    if is_windows():
+        result = run_command(["ipconfig", "/all"], timeout=15)
+        if result["stdout"]:
+            print(result["stdout"])
+            return
+        print("Windows interface information unavailable.")
+        return
+
     if command_exists("ip"):
 
         result = run_command(
@@ -2328,7 +2653,7 @@ def show_interfaces():
 
 
 # ============================================================
-# TCP DISCOVERY
+# ICMP + TCP DISCOVERY
 # ============================================================
 
 def tcp_open(
@@ -2364,31 +2689,154 @@ def reverse_dns(ip):
         return "Unknown"
 
 
+def icmp_responds(ip):
+    """Perform one bounded echo request using the platform's native ping."""
+    if not command_exists("ping"):
+        return False
+
+    if is_windows():
+        args = ["ping", "-n", "1", "-w", str(ICMP_TIMEOUT_MS), ip]
+        marker = "ttl="
+    else:
+        args = ["ping", "-c", "1", "-W", "1", ip]
+        marker = "ttl="
+
+    result = run_command(args, timeout=3)
+    return result["returncode"] == 0 and marker in result["stdout"].lower()
+
+def load_device_labels():
+    """Load private, local-only device names keyed by MAC address."""
+    data = load_json_file(DEVICE_LABELS_FILE)
+    return data if isinstance(data, dict) else {}
+
+
+def device_label(device, labels=None):
+    labels = labels if labels is not None else load_device_labels()
+    mac = str(device.get("mac_address") or "").lower()
+    return str(labels.get(mac) or "").strip()
+
+
+def label_devices_menu():
+    devices = LAST_DISCOVERY or []
+    if not devices:
+        print("Run ‘Scan my network’ first.")
+        return
+    labels = load_device_labels()
+    for number, device in enumerate(devices, 1):
+        print(f"{number:>2}. {device['ip']:15} {device_label(device, labels) or display_hostname(device.get('hostname'))}")
+    choice = input("Choose a device to name (or press Enter to cancel): ").strip()
+    if not choice.isdigit() or not 1 <= int(choice) <= len(devices):
+        return
+    device = devices[int(choice) - 1]
+    mac = device.get("mac_address")
+    if not mac:
+        print("This device has no observed MAC address, so a durable label cannot be saved.")
+        return
+    name = input("Private label (blank removes it): ").strip()
+    if name:
+        labels[mac.lower()] = name[:80]
+    else:
+        labels.pop(mac.lower(), None)
+    save_json_file(DEVICE_LABELS_FILE, labels)
+    print("Device label saved locally.")
+
+
+def local_neighbor_table():
+    """Read locally cached ARP/neighbour entries; no packets are sent."""
+    entries = {}
+    if is_windows():
+        result = run_command(["arp", "-a"], timeout=10)
+        pattern = r"(?m)^\s*(\d+\.\d+\.\d+\.\d+)\s+([0-9a-f-]{17})\s+\S+"
+    elif command_exists("ip"):
+        result = run_command(["ip", "neigh", "show"], timeout=10)
+        pattern = r"(?m)^(\d+\.\d+\.\d+\.\d+).*?\blladdr\s+([0-9a-f:]{17})\b"
+    else:
+        return entries
+    for ip, mac in re.findall(pattern, result["stdout"], re.I):
+        entries[ip] = mac.replace("-", ":").lower()
+    return entries
+
+
+def display_hostname(hostname):
+    """Avoid confusing casing variants of an unavailable reverse-DNS name."""
+    text = str(hostname or "").strip()
+    return "Unknown" if not text or text.lower() == "unknown" else text
+
+
+def mac_note(mac):
+    if not mac:
+        return "Not observed"
+    try:
+        locally_administered = bool(int(mac[:2], 16) & 2)
+    except ValueError:
+        return mac
+    return mac + (" (locally administered)" if locally_administered else "")
+
+
+def console_oui_hint(mac):
+    """Return a deliberately qualified console clue from a global MAC OUI."""
+    if not mac:
+        return None
+    try:
+        if int(mac[:2], 16) & 2:
+            return None
+    except ValueError:
+        return None
+    return CONSOLE_OUI_HINTS.get(mac.lower()[:8])
+
+
+def ssdp_console_evidence(timeout=2.0):
+    """Collect voluntary local SSDP advertisements with one standard query.
+
+    This does not authenticate, connect to a device UI, or follow any returned
+    URL. Responses are used only as model/name evidence for the inventory.
+    """
+    request = (
+        "M-SEARCH * HTTP/1.1\r\n"
+        "HOST: 239.255.255.250:1900\r\n"
+        "MAN: \"ssdp:discover\"\r\n"
+        "MX: 1\r\n"
+        "ST: ssdp:all\r\n\r\n"
+    ).encode("ascii")
+    found = {}
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
+            sock.settimeout(0.25)
+            sock.sendto(request, ("239.255.255.250", 1900))
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                try:
+                    payload, address = sock.recvfrom(8192)
+                except socket.timeout:
+                    continue
+                text = payload.decode("utf-8", errors="replace")
+                lowered = text.lower()
+                if any(word in lowered for word in ("playstation", "sony interactive", "xbox", "nintendo")):
+                    found.setdefault(address[0], []).append(" ".join(text.splitlines()[:8])[:500])
+    except OSError:
+        pass
+    return found
+
+
 def discover_host(ip):
-
-    open_ports = []
-
-    for port in DISCOVERY_PORTS:
-
-        if tcp_open(
-            ip,
-            port,
-            DISCOVERY_TIMEOUT,
-        ):
-
-            open_ports.append(port)
-
-    if not open_ports:
+    """Retain a local host when it answers ICMP, TCP, or both."""
+    icmp = icmp_responds(ip)
+    open_ports = [port for port in DISCOVERY_PORTS if tcp_open(ip, port, DISCOVERY_TIMEOUT)]
+    if not icmp and not open_ports:
         return None
 
     return {
         "ip": ip,
         "hostname": reverse_dns(ip),
         "open_ports": open_ports,
+        "icmp": icmp,
+        "tcp": bool(open_ports),
     }
 
 
 def discover_devices():
+
+    global LAST_DISCOVERY
 
     heading("LOCAL DEVICE DISCOVERY")
 
@@ -2432,9 +2880,8 @@ def discover_devices():
 
     print()
     print(
-        "Discovery uses TCP connection checks. "
-        "Devices exposing none of the tested "
-        "services may not appear."
+        "Discovery uses one ICMP echo plus fixed TCP service checks. "
+        "Hosts answering either method are retained."
     )
 
     discovered = {}
@@ -2451,7 +2898,7 @@ def discover_devices():
         )
 
         with concurrent.futures.ThreadPoolExecutor(
-            max_workers=64
+            max_workers=DISCOVERY_WORKERS
         ) as executor:
 
             futures = {
@@ -2488,6 +2935,8 @@ def discover_devices():
                         ],
                         "open_ports": set(),
                         "seen": 0,
+                        "icmp_seen": 0,
+                        "tcp_seen": 0,
                     }
 
                 discovered[ip]["seen"] += 1
@@ -2497,6 +2946,9 @@ def discover_devices():
                 ].update(
                     result["open_ports"]
                 )
+                # Treat an absent/indeterminate probe result as not observed.
+                discovered[ip]["icmp_seen"] += int(bool(result.get("icmp")))
+                discovered[ip]["tcp_seen"] += int(bool(result.get("tcp")))
 
                 if (
                     discovered[ip]["hostname"]
@@ -2516,8 +2968,18 @@ def discover_devices():
         item["open_ports"] = sorted(
             item["open_ports"]
         )
+        item["icmp"] = bool(item["icmp_seen"])
+        item["tcp"] = bool(item["tcp_seen"])
 
         results.append(item)
+
+    neighbors = local_neighbor_table()
+    ssdp = ssdp_console_evidence()
+    for item in results:
+        item["hostname"] = display_hostname(item["hostname"])
+        item["mac_address"] = neighbors.get(item["ip"])
+        item["console_hint"] = console_oui_hint(item["mac_address"])
+        item["ssdp_console_evidence"] = ssdp.get(item["ip"], [])
 
     results.sort(
         key=lambda item:
@@ -2525,6 +2987,9 @@ def discover_devices():
             item["ip"]
         )
     )
+
+    LAST_DISCOVERY = results
+    labels = load_device_labels()
 
     print()
 
@@ -2548,21 +3013,41 @@ def discover_devices():
             str(port)
             for port in item["open_ports"]
         )
+        methods = "+".join(
+            method for method, present in (
+                ("ICMP", item["icmp"]),
+                ("TCP", item["tcp"]),
+            ) if present
+        )
 
+        shown_hostname = (device_label(item, labels) or item["hostname"])[:25]
         print(
             f"{ip:15} "
             f"{role:11} "
-            f"{item['hostname'][:25]:25} "
+            f"{shown_hostname:25} "
             f"Seen {item['seen']}/{DISCOVERY_PASSES} "
-            f"Ports: {ports}"
+            f"Via: {methods:8} Ports: {ports or 'none'}"
         )
+        print(f"{'':15} MAC: {mac_note(item['mac_address'])}")
+        if item["console_hint"]:
+            vendor, clue = item["console_hint"]
+            print(f"{'':15} Console clue: {clue} ({vendor} MAC-prefix evidence)")
+        if item["ssdp_console_evidence"]:
+            print(f"{'':15} Console clue: Advertised through SSDP (stronger product evidence)")
+
+    icmp_only = sum(item["icmp"] and not item["tcp"] for item in results)
+    tcp_only = sum(item["tcp"] and not item["icmp"] for item in results)
+    both = sum(item["icmp"] and item["tcp"] for item in results)
+    intermittent = sum(item["seen"] < DISCOVERY_PASSES for item in results)
+    print()
+    print(f"Discovery summary: {both} ICMP+TCP, {icmp_only} ICMP-only, {tcp_only} TCP-only, {intermittent} intermittent.")
 
     add_finding(
         "INFO",
         "LAN",
         (
-            f"{len(results)} responding device(s) "
-            "were discovered using TCP service checks."
+            f"{len(results)} responding device(s) were discovered using "
+            "ICMP and/or fixed TCP service checks."
         ),
     )
 
@@ -3540,237 +4025,149 @@ def identify_device(
     web_results,
     gateway=None,
 ):
-
-    combined = " ".join(
-        result.get("text", "")
-        for result in web_results
-    )
-
-    combined = (
-        f"{hostname} {combined}"
-    )
-
+    valid_web = [result for result in web_results if isinstance(result, dict)]
+    combined = " ".join(result.get("text", "") for result in valid_web)
+    combined = f"{hostname} {combined}"
     lower = combined.lower()
+    hostname_lower = str(hostname or "").lower()
 
     manufacturer = "Unknown"
     device_type = "Network device"
     product = "Unknown"
     model = "Unknown"
     confidence = "Low"
-
     evidence = []
     applications = []
 
-    for result in web_results:
+    for result in valid_web:
+        for application in result.get("applications", []):
+            identity = (application["name"], application["port"])
+            if not any((existing["name"], existing["port"]) == identity for existing in applications):
+                applications.append(application)
 
-        for application in result.get(
-            "applications",
-            [],
-        ):
+    # Strong branded gateway evidence is evaluated before generic vendor text so
+    # unrelated strings in bundled assets cannot override the observed router.
+    sky_evidence = any(
+        "sky hub" in " ".join((str(result.get("title") or ""), str(result.get("server") or ""))).lower()
+        or "sky_router" in str(result.get("server") or "").lower()
+        for result in valid_web
+    ) or hostname_lower.startswith("skyrouter")
 
-            identity = (
-                application["name"],
-                application["port"],
-            )
-
-            if not any(
-                (
-                    existing["name"],
-                    existing["port"],
-                ) == identity
-                for existing in applications
-            ):
-
-                applications.append(
-                    application
-                )
-
-    # ASUS router patterns.
-
-    asus_match = re.search(
-        r"\b("
-        r"RT-(?:AC|AX|BE)[A-Z0-9\-]+"
-        r"|GT-(?:AC|AX|BE)[A-Z0-9\-]+"
-        r")\b",
-        combined,
-        re.I,
-    )
-
-    if asus_match:
-
-        manufacturer = "ASUS"
-        model = asus_match.group(1)
+    if sky_evidence:
+        manufacturer = "Sky"
+        product = "Sky Hub"
         confidence = "High"
+        evidence.append("Sky Hub title/server/hostname evidence detected")
 
-        evidence.append(
-            f"Recognised ASUS model pattern: {model}"
+    if not sky_evidence:
+        asus_match = re.search(
+            r"\b(RT-(?:AC|AX|BE)[A-Z0-9\-]+|GT-(?:AC|AX|BE)[A-Z0-9\-]+)\b",
+            combined,
+            re.I,
         )
-
-    if (
-        "asus" in lower
-        or "asuswrt" in lower
-        or "zenwifi" in lower
-    ):
-
-        manufacturer = "ASUS"
-
-        evidence.append(
-            "ASUS indicator detected"
-        )
-
-    # Proxmox requires actual management evidence
-    # rather than port 8006 alone.
+        if asus_match:
+            manufacturer = "ASUS"
+            model = asus_match.group(1)
+            confidence = "High"
+            evidence.append(f"Recognised ASUS model pattern: {model}")
+        else:
+            asus_strong = hostname_lower.startswith("asus") or any(
+                any(token in " ".join((str(result.get("title") or ""), str(result.get("server") or ""))).lower()
+                    for token in ("asus", "asuswrt", "zenwifi"))
+                for result in valid_web
+            )
+            if asus_strong:
+                manufacturer = "ASUS"
+                evidence.append("ASUS hostname or management-interface indicator detected")
 
     proxmox_evidence = any(
-        (
-            "proxmox" in result.get(
-                "text",
-                "",
-            ).lower()
-            or "pve-api-daemon" in result.get(
-                "text",
-                "",
-            ).lower()
-        )
-        for result in web_results
+        "proxmox" in result.get("text", "").lower()
+        or "pve-api-daemon" in result.get("text", "").lower()
+        for result in valid_web
     )
-
     if proxmox_evidence:
-
         manufacturer = "Proxmox"
         device_type = "Virtualisation host"
         product = "Proxmox VE"
         confidence = "High"
+        evidence.append("Proxmox web management indicators detected")
 
-        evidence.append(
-            "Proxmox web management indicators detected"
-        )
-
-    # TrueNAS.
-
-    truenas_evidence = (
-        "truenas" in lower
-        or hostname.lower().startswith(
-            "truenas"
-        )
-    )
-
+    truenas_evidence = "truenas" in lower or hostname_lower.startswith("truenas")
     if truenas_evidence:
-
         manufacturer = "iXsystems / TrueNAS"
         device_type = "NAS / storage server"
         product = "TrueNAS"
         confidence = "High"
+        evidence.append("TrueNAS hostname/web indicator detected")
 
-        evidence.append(
-            "TrueNAS hostname/web indicator detected"
-        )
-
-    # TP-Link.
-
-    if (
-        "tp-link" in lower
-        or "tp link" in lower
-        or "tp-link corporation" in lower
-    ):
-
+    if "tp-link" in lower or "tp link" in lower or "tp-link corporation" in lower:
         manufacturer = "TP-Link"
-
         if confidence == "Low":
             confidence = "Medium"
+        evidence.append("TP-Link branding detected")
 
-        evidence.append(
-            "TP-Link branding detected"
-        )
-
-    tp_match = re.search(
-        r"\b("
-        r"TL-(?:SG|SX|SL|SF|ER)"
-        r"[A-Z0-9\-]+"
-        r")\b",
-        combined,
-        re.I,
-    )
-
+    tp_match = re.search(r"\b(TL-(?:SG|SX|SL|SF|ER)[A-Z0-9\-]+)\b", combined, re.I)
     if tp_match:
-
         manufacturer = "TP-Link"
         model = tp_match.group(1)
         confidence = "High"
+        evidence.append(f"TP-Link model identifier detected: {model}")
 
-        evidence.append(
-            f"TP-Link model identifier detected: {model}"
-        )
-
-    # Do not call something a switch merely because
-    # TP-Link manufactured it.
-
-    switch_clues = []
-
-    for result in web_results:
-
-        switch_clues.extend(
-            result.get(
-                "js_info",
-                {},
-            ).get(
-                "switch_clues",
-                [],
-            )
-        )
-
-    switch_clues = list(
-        dict.fromkeys(
-            switch_clues
-        )
+    # HP printer: require printing services plus explicit HP evidence.
+    hp_text = " ".join(
+        " ".join((str(result.get("server") or ""), str(result.get("title") or ""), str(result.get("text") or "")))
+        for result in valid_web
     )
+    hp_printer_evidence = (
+        631 in open_ports
+        and 9100 in open_ports
+        and ("hp " in hp_text.lower() or hostname_lower.startswith("hp"))
+    )
+    if hp_printer_evidence:
+        manufacturer = "HP"
+        device_type = "Printer"
+        confidence = "High"
+        product_match = re.search(r"HP\s+(ENVY\s+\d+\s+series)", hp_text, re.I)
+        model_match = re.search(r"HP\s+ENVY\s+\d+\s+series\s*-\s*([A-Z0-9-]+)", hp_text, re.I)
+        if product_match:
+            product = "HP " + product_match.group(1)
+        else:
+            product = "HP network printer"
+        if model_match:
+            model = model_match.group(1)
+        evidence.append("HP web banner plus IPP and raw-printing service evidence detected")
 
-    if switch_clues:
+    # Contextual camera clue: RTSP plus multiple web-management ports, or an
+    # explicit camera-style hostname. This remains a qualified family-level ID.
+    web_port_count = sum(1 for port in open_ports if port in WEB_PORTS)
+    camera_context = 554 in open_ports and (
+        web_port_count >= 2
+        or any(token in hostname_lower for token in ("ipcam", "camera", "cam"))
+    )
+    if camera_context and device_type == "Network device" and manufacturer == "Unknown":
+        device_type = "Possible IP camera / surveillance device"
+        confidence = "Medium"
+        evidence.append("RTSP plus web-management service pattern is consistent with an IP camera")
 
+    # Ignore a lone generic 'poe' token. It is too weak to classify a device as
+    # a switch because routers and other appliances can contain that text too.
+    switch_clues = []
+    for result in valid_web:
+        switch_clues.extend(result.get("js_info", {}).get("switch_clues", []))
+    switch_clues = list(dict.fromkeys(switch_clues))
+    strong_switch_clues = [clue for clue in switch_clues if str(clue).strip().lower() not in {"poe"}]
+    if strong_switch_clues and device_type == "Network device":
         device_type = "Managed network switch"
+        evidence.append("Switch-management indicators: " + ", ".join(strong_switch_clues[:5]))
+        confidence = "High" if manufacturer != "Unknown" else "Medium"
 
-        evidence.append(
-            "Switch-management indicators: "
-            + ", ".join(
-                switch_clues[:5]
-            )
-        )
-
-        confidence = (
-            "High"
-            if manufacturer != "Unknown"
-            else "Medium"
-        )
-
-    # Gateway role has priority.
-
-    if (
-        gateway
-        and ip == gateway
-    ):
-
+    if gateway and ip == gateway:
         device_type = "Router / gateway"
-
-        evidence.append(
-            "Address matches confirmed LAN gateway"
-        )
-
+        evidence.append("Address matches confirmed LAN gateway")
         if manufacturer != "Unknown":
             confidence = "High"
-
-    elif (
-        manufacturer != "Unknown"
-        and device_type == "Network device"
-        and any(
-            port in open_ports
-            for port in WEB_PORTS
-        )
-    ):
-
-        device_type = (
-            "Web-managed network device"
-        )
-
+    elif manufacturer != "Unknown" and device_type == "Network device" and any(port in open_ports for port in WEB_PORTS):
+        device_type = "Web-managed network device"
         if confidence == "Low":
             confidence = "Medium"
 
@@ -3781,13 +4178,8 @@ def identify_device(
         "model": model,
         "confidence": confidence,
         "applications": applications,
-        "evidence": list(
-            dict.fromkeys(
-                evidence
-            )
-        ),
+        "evidence": list(dict.fromkeys(evidence)),
     }
-
 
 # ============================================================
 # MANAGEMENT TRANSPORT
@@ -3797,123 +4189,75 @@ def analyse_management_transport(
     ip,
     web_results,
 ):
-
-    http_results = [
-        result
-        for result in web_results
-        if (
-            not result.get("error")
-            and result.get("scheme") == "http"
-        )
+    http_attempts = [
+        result for result in web_results
+        if isinstance(result, dict) and result.get("scheme") == "http"
     ]
-
-    https_results = [
-        result
-        for result in web_results
-        if (
-            not result.get("error")
-            and result.get("scheme") == "https"
-        )
+    https_attempts = [
+        result for result in web_results
+        if isinstance(result, dict) and result.get("scheme") == "https"
     ]
-
-    http_auth = [
-        result
-        for result in http_results
-        if result.get("auth")
-    ]
-
-    https_auth = [
-        result
-        for result in https_results
-        if result.get("auth")
-    ]
-
-    secure_redirects = [
-        result
-        for result in http_results
-        if result.get("secure_redirect")
-    ]
+    http_results = [result for result in http_attempts if not result.get("error")]
+    https_results = [result for result in https_attempts if not result.get("error")]
+    http_auth = [result for result in http_results if result.get("auth")]
+    https_auth = [result for result in https_results if result.get("auth")]
+    secure_redirects = [result for result in http_results if result.get("secure_redirect")]
+    https_errors = [result.get("error") for result in https_attempts if result.get("error")]
 
     if http_auth:
-
         if secure_redirects:
-
             add_finding(
-                "INFO",
-                "Management interfaces",
-                (
-                    "HTTP authentication-related content "
-                    "redirects towards HTTPS."
-                ),
-                ip,
+                "INFO", "Management interfaces",
+                "HTTP authentication-related content redirects towards HTTPS.", ip,
             )
-
         elif https_results:
-
             add_finding(
-                "CAUTION",
-                "Management interfaces",
-                (
-                    "Authentication-related content is accessible over HTTP "
-                    "and no redirect to HTTPS was observed. HTTPS is available "
-                    "separately. No credentials were submitted, so the transport "
-                    "used by an actual login submission was not verified."
-                ),
+                "CAUTION", "Management interfaces",
+                "Authentication-related content is accessible over HTTP and no redirect to HTTPS was observed. HTTPS is available separately. No credentials were submitted, so the transport used by an actual login submission was not verified.",
                 ip,
             )
-
+        elif https_attempts:
+            add_finding(
+                "CAUTION", "Management interfaces",
+                "Authentication-related content was detected over HTTP. An HTTPS port was open, but the sampled HTTPS/TLS request failed and no secure redirect was observed.",
+                ip,
+            )
         else:
-
             add_finding(
-                "CAUTION",
-                "Management interfaces",
-                (
-                    "Authentication-related content was "
-                    "detected over HTTP and no HTTPS "
-                    "management service was detected."
-                ),
+                "CAUTION", "Management interfaces",
+                "Authentication-related content was detected over HTTP and no HTTPS management service was detected.",
                 ip,
             )
-
     elif http_results and https_results:
-
         add_finding(
-            "INFO",
-            "Management interfaces",
-            (
-                "HTTP and HTTPS web services are both "
-                "available. No credential submission "
-                "was attempted."
-            ),
+            "INFO", "Management interfaces",
+            "HTTP and HTTPS web services are both available. No credential submission was attempted.", ip,
+        )
+    elif http_results and https_attempts:
+        add_finding(
+            "INFO", "Management interfaces",
+            "HTTP web service detected. An HTTPS-designated TCP port was also open, but the sampled HTTPS/TLS request was not usable.",
             ip,
         )
-
     elif http_results:
-
-        add_finding(
-            "INFO",
-            "Management interfaces",
-            "HTTP web service detected.",
-            ip,
-        )
-
+        add_finding("INFO", "Management interfaces", "HTTP web service detected.", ip)
     elif https_results:
-
+        add_finding("INFO", "Management interfaces", "HTTPS web service detected.", ip)
+    elif https_attempts:
         add_finding(
-            "INFO",
-            "Management interfaces",
-            "HTTPS web service detected.",
-            ip,
+            "INFO", "Management interfaces",
+            "An HTTPS-designated TCP port was open, but the sampled HTTPS/TLS request was not usable.", ip,
         )
 
     return {
         "http": bool(http_results),
         "https": bool(https_results),
+        "https_port_open": bool(https_attempts),
+        "https_error": https_errors[0] if https_errors else None,
         "http_auth": bool(http_auth),
         "https_auth": bool(https_auth),
         "secure_redirect": bool(secure_redirects),
     }
-
 
 # ============================================================
 # DEVICE ANALYSIS
@@ -3984,10 +4328,13 @@ def analyse_device_engine(
     ip,
     lan,
     known_ports=None,
+    mac_address=None,
     verbose=True,
 ):
 
     hostname = reverse_dns(ip)
+    mac_address = mac_address or local_neighbor_table().get(ip)
+    console_hint = console_oui_hint(mac_address)
 
     if known_ports is None:
 
@@ -4116,6 +4463,18 @@ def analyse_device_engine(
         gateway=lan.get("gateway"),
     )
 
+    # A MAC OUI can support a qualified family-level clue, but never an exact
+    # console model. Preserve stronger service/banner identification if present.
+    if console_hint and identity.get("product") == "Unknown":
+        vendor, clue = console_hint
+        identity["manufacturer"] = vendor
+        identity["device_type"] = "Possible game console"
+        identity["product"] = clue
+        identity["confidence"] = "Medium"
+        identity.setdefault("evidence", []).append(
+            f"{vendor} MAC-prefix evidence ({mac_address})"
+        )
+
     transport = analyse_management_transport(
         ip,
         web_results,
@@ -4162,6 +4521,9 @@ def analyse_device_engine(
         print(
             f"Confidence   : {identity['confidence']}"
         )
+
+        if mac_address:
+            print(f"MAC address  : {mac_note(mac_address)}")
 
         if identity["applications"]:
 
@@ -4221,19 +4583,29 @@ def analyse_device_engine(
             )
 
             print(
-                f"HTTPS available    : "
+                f"HTTPS port open    : "
+                f"{'Yes' if transport.get('https_port_open') else 'No'}"
+            )
+
+            print(
+                f"HTTPS usable       : "
                 f"{'Yes' if transport['https'] else 'No'}"
             )
+
+            if transport.get("https_port_open") and not transport.get("https"):
+                print("TLS/HTTPS status   : Open TCP port, negotiation/request failed")
 
             print(
                 f"HTTP auth evidence : "
                 f"{'Yes' if transport['http_auth'] else 'No'}"
             )
 
-            print(
-                f"HTTPS redirect     : "
-                f"{'Detected' if transport['secure_redirect'] else 'Not detected'}"
+            redirect_text = (
+                "Detected" if transport['secure_redirect']
+                else "Not detected" if transport['http']
+                else "Not applicable"
             )
+            print(f"HTTPS redirect     : {redirect_text}")
 
     return {
         "ip": ip,
@@ -4245,6 +4617,8 @@ def analyse_device_engine(
         "identity": identity,
         "transport": transport,
         "os_evidence": os_evidence,
+        "mac_address": mac_address,
+        "console_hint": console_hint,
     }
 
 
@@ -4360,6 +4734,7 @@ def analyse_discovered_devices(
             device["ip"],
             lan,
             known_ports=device["open_ports"],
+            mac_address=device.get("mac_address"),
             verbose=False,
         )
 
@@ -4601,13 +4976,7 @@ def suppress_redundant_management_findings(analysed):
         category = finding.get("category", "")
         message = finding.get("message", "")
 
-        redundant = (
-            device in app_hosts
-            and category == "Management interfaces"
-            and
-            "Authentication-related content is visible over HTTP and HTTPS is also available"
-            in message
-        )
+        redundant = device in app_hosts and category == "Management interfaces"
 
         if not redundant:
             kept.append(finding)
@@ -4641,7 +5010,7 @@ def assess_application_web_transport(analysed):
                 web = analyse_web_service(
                     ip,
                     port,
-                    scheme,
+                    verbose=False,
                 )
             except Exception:
                 web = None
@@ -4993,6 +5362,12 @@ def assess_service_exposure(analysed):
                 ),
             )
 
+            if port in HTTPS_PORTS and not (result.get("tls") or {}).get(port):
+                explanation = (
+                    "TCP port is open, but TLS negotiation was not confirmed "
+                    "during this audit."
+                )
+
             level = "INFO"
 
             if port in (23,):
@@ -5155,7 +5530,7 @@ def compare_baseline_data(old, current, lan, record_findings=True):
                 "Baseline changes",
                 (
                     "Device in the baseline did not respond to this "
-                    "TCP discovery scan."
+                    "ICMP/TCP discovery scan."
                 ),
                 ip,
             )
@@ -5367,6 +5742,13 @@ def save_baseline():
                 "ip": device["ip"],
                 "hostname": device["hostname"],
                 "open_ports": device["open_ports"],
+                "discovery_methods": [
+                    method for method, present in (
+                        ("icmp", device.get("icmp")),
+                        ("tcp", device.get("tcp")),
+                    ) if present
+                ],
+                "mac_address": device.get("mac_address"),
             }
             for device in devices
         ],
@@ -5458,7 +5840,7 @@ def compare_baseline():
             "Baseline changes",
             (
                 "Device in the baseline did not "
-                "respond to this TCP discovery scan."
+                "respond to this ICMP/TCP discovery scan."
             ),
             ip,
         )
@@ -6456,9 +6838,9 @@ def save_report():
             "NOTES",
             "=" * 72,
             (
-                "Discovery is based on TCP connection checks. "
-                "Devices exposing none of the tested services may "
-                "not appear."
+                "Discovery uses one ICMP echo plus fixed TCP connection "
+                "checks. Hosts answering either method can appear; an "
+                "empty port list does not mean the host is unreachable."
             ),
             (
                 "WiFi overlap observations are estimates based on "
@@ -6506,37 +6888,39 @@ def save_report():
 # STARTUP
 # ============================================================
 
+def print_startup_banner():
+    print()
+    print(" __        ___ _____ ___    _   _   _ ____ ___ _____ ___  ____ ")
+    print(" \\ \\      / (_)  ___|_ _|  / \\ | | | | |  _ \\_ _|_   _/ _ \\|  _ \\")
+    print("  \\ \\ /\\ / /| | |_   | |  / _ \\| | | | | | | | | | | || | | | |_) |")
+    print("   \\ V  V / | |  _|  | | / ___ \\| |_| | |_| | | | | || |_| |  _ <")
+    print("    \\_/\\_/  |_|_|   |___/_/   \\_\\\\___/|____/___|_|  \\___/|_| \\_\\")
+    print()
+    print("                 AUTHORISED SECURITY AUDITING")
+
+
 def environment_check():
 
+    print_startup_banner()
     heading("STARTUP CHECK")
 
     print(
         ("WiFi Security Auditor Development" if VERSION == "development" else f"WiFi Security Auditor {version_display_name()}")
     )
 
-    print(
-        f"Android           : "
-        f"{'Yes' if is_android() else 'No'}"
-    )
+    platform_name = "Windows" if is_windows() else ("Android" if is_android() else sys.platform)
+    print(f"Platform          : {platform_name}")
+    print(f"Python            : {sys.version.split()[0]}")
 
-    print(
-        f"Termux            : "
-        f"{'Yes' if is_termux() else 'No'}"
-    )
-
-    api_available = (
-        command_exists(
-            "termux-wifi-connectioninfo"
-        )
-        and command_exists(
-            "termux-wifi-scaninfo"
-        )
-    )
-
-    print(
-        f"Termux WiFi API   : "
-        f"{'Available' if api_available else 'Missing'}"
-    )
+    if is_windows():
+        print("WiFi support      : Windows netsh/ipconfig")
+        print(f"ICMP discovery    : {'Available' if command_exists('ping') else 'Unavailable'}")
+        print("TCP discovery     : Available")
+    else:
+        print(f"Android           : {'Yes' if is_android() else 'No'}")
+        print(f"Termux            : {'Yes' if is_termux() else 'No'}")
+        api_available = command_exists("termux-wifi-connectioninfo") and command_exists("termux-wifi-scaninfo")
+        print(f"Termux WiFi API   : {'Available' if api_available else 'Missing'}")
 
     connection, error = (
         get_wifi_connection()
@@ -6545,13 +6929,13 @@ def environment_check():
     if error:
 
         print(
-            f"WiFi API status   : {error}"
+            f"WiFi status       : {error}"
         )
 
         return
 
     print(
-        "WiFi API status   : Working"
+        "WiFi status       : Working"
     )
 
     print(
@@ -6598,6 +6982,48 @@ def environment_check():
 # MENU
 # ============================================================
 
+def dashboard():
+    heading("NETWORK DASHBOARD")
+    lan = detect_lan()
+    history = load_device_history()
+    print(f"Network       : {lan.get('network') or 'Not confirmed'}")
+    print(f"Gateway       : {lan.get('gateway') or 'Unknown'}")
+    print(f"Known devices : {len(history.get('devices', {}))}")
+    print(f"Saved audits  : {history.get('audit_count', 0)}")
+    print("Next step     : Scan my network, then label or analyse a device.")
+
+
+def quick_audit():
+    heading("QUICK NETWORK CHECK")
+    devices, _ = discover_devices()
+    both = sum(d.get("icmp") and d.get("tcp") for d in devices)
+    print(f"Quick check complete: {len(devices)} responding device(s), {both} seen by both methods.")
+
+
+def analyse_discovered_device():
+    devices = LAST_DISCOVERY
+    if not devices:
+        print("Run ‘Scan my network’ first.")
+        return
+    labels = load_device_labels()
+    for number, device in enumerate(devices, 1):
+        print(f"{number:>2}. {device['ip']:15} {device_label(device, labels) or device['hostname']}")
+    choice = input("Choose a device (or press Enter to cancel): ").strip()
+    if not choice.isdigit() or not 1 <= int(choice) <= len(devices):
+        return
+    device = devices[int(choice) - 1]
+    lan = detect_lan()
+    if lan.get("confirmed"):
+        analyse_device_engine(device["ip"], lan, known_ports=device["open_ports"], mac_address=device.get("mac_address"), verbose=True)
+
+
+def show_help():
+    heading("HELP AND LIMITS")
+    print("ICMP-only means a host replied to one ping but no checked TCP service replied.")
+    print("Intermittent means a host appeared in only one discovery pass; it may be asleep.")
+    print("All active checks stay inside the confirmed private LAN and use fixed ports only.")
+    print("Reports, labels, history and baselines are private local files and should not be published.")
+
 def menu():
 
     while True:
@@ -6609,9 +7035,7 @@ def menu():
             f" WIFI SECURITY AUDITOR {version_display_name()}"
         )
 
-        print(
-            " TERMUX / ANDROID EDITION"
-        )
+        print(" WINDOWS / TERMUX / ANDROID EDITION")
 
         print("=" * 72)
 
@@ -6682,6 +7106,12 @@ def menu():
             "15. Exit"
         )
 
+        print("16. Dashboard")
+        print("17. Quick network check")
+        print("18. Analyse a scanned device")
+        print("19. Name a device locally")
+        print("20. Help and limits")
+
         choice = input(
             "\nChoose an option: "
         ).strip()
@@ -6750,6 +7180,21 @@ def menu():
             )
 
             break
+
+        elif choice == "16":
+            dashboard()
+
+        elif choice == "17":
+            quick_audit()
+
+        elif choice == "18":
+            analyse_discovered_device()
+
+        elif choice == "19":
+            label_devices_menu()
+
+        elif choice == "20":
+            show_help()
 
         else:
 
