@@ -17,3 +17,5 @@ __pycache__/
 *.tmp
 *.bak
 *~
+
+wifi_auditor_device_labels.json
